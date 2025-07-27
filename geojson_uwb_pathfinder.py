@@ -1,77 +1,20 @@
 import json
-import math
-import time
-import argparse
-import geopandas as gpd
 import networkx as nx
+import geopandas as gpd
+import time
+from pymavlink import mavutil
 from dronekit import connect, VehicleMode, LocationGlobalRelative
 
-
-def connectMyCopter():
-    parser = argparse.ArgumentParser(description='Drone command line')
-    parser.add_argument('--connect', default='127.0.0.1:14550', help="Vehicle connection string")
-    parser.add_argument('--geojson', default='uwb.geojson', help="GeoJSON file with paths")
-    args = parser.parse_args()
-    connection_string = args.connect
-    vehicle = connect(connection_string, baud=57600, wait_ready=True)
-    return vehicle, args
-
-def get_direction_to_target(targetLocation, currentLocation):
-    dLat = targetLocation.lat - currentLocation.lat
-    dLon = targetLocation.lon - currentLocation.lon
-    angle = math.atan2(dLon, dLat) * (180 / math.pi)
-    if angle < 0:
-        angle += 360 
-
-    if 337.5 <= angle < 360 or 0 <= angle < 22.5:
-        direction = "N"
-    elif 22.5 <= angle < 67.5:
-        direction = "NE"
-    elif 67.5 <= angle < 112.5:
-        direction = "E"
-    elif 112.5 <= angle < 157.5:
-        direction = "SE"
-    elif 157.5 <= angle < 202.5:
-        direction = "S"
-    elif 202.5 <= angle < 247.5:
-        direction = "SW"
-    elif 247.5 <= angle < 292.5:
-        direction = "W"
-    elif 292.5 <= angle < 337.5:
-        direction = "NW"
-
-    return f"{direction} ({angle:.1f}°)"
-
 def haversine_distance(lat1, lon1, lat2, lon2):
-    R = 6371000  # meters
-    phi1, phi2 = math.radians(lat1), math.radians(lat2)
-    delta_phi = math.radians(lat2 - lat1)
-    delta_lambda = math.radians(lon2 - lon1)
-    a = math.sin(delta_phi / 2)**2 + math.cos(phi1)*math.cos(phi2)*math.sin(delta_lambda / 2)**2
-    c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+    from math import radians, cos, sin, sqrt, atan2
+    R = 6371e3
+    φ1, φ2 = radians(lat1), radians(lat2)
+    Δφ = radians(lat2 - lat1)
+    Δλ = radians(lon2 - lon1)
+
+    a = sin(Δφ / 2)**2 + cos(φ1) * cos(φ2) * sin(Δλ / 2)**2
+    c = 2 * atan2(sqrt(a), sqrt(1 - a))
     return R * c
-
-def calculate_direction(targetLocation, vehicle):
-    while True:
-        currentLocation = vehicle.location.global_relative_frame
-        if currentLocation and currentLocation.lat and currentLocation.lon:
-            direction = get_direction_to_target(targetLocation, currentLocation)
-            distance = haversine_distance(
-                currentLocation.lat, currentLocation.lon, targetLocation.lat, targetLocation.lon
-            )
-            print(f"Current Location: ({currentLocation.lat}, {currentLocation.lon})")
-            print(f"Target: ({targetLocation.lat}, {targetLocation.lon})")
-            print(f"Direction to target: {direction}")
-            print(f"Distance: {distance:.2f} meters\n")
-            if distance < 5:
-                print("✅ Reached waypoint!")
-                break
-            time.sleep(1)
-        else:
-            print("Waiting for valid location data...")
-            time.sleep(1)
-
-# Pathfinding Functions
 
 def load_graph_from_geojson(geojson_file):
     with open(geojson_file, "r") as f:
@@ -81,50 +24,69 @@ def load_graph_from_geojson(geojson_file):
     print(gdf.head())
 
     G = nx.Graph()
-    # Build graph using LineString features
     for idx, row in gdf.iterrows():
         geom = row['geometry']
         if geom.geom_type == 'LineString':
             coords = list(geom.coords)
             for i in range(len(coords) - 1):
-                x1, y1 = coords[i]
-                x2, y2 = coords[i + 1]
-                distance = math.sqrt((x2 - x1)**2 + (y2 - y1)**2)
-                G.add_edge((y1, x1), (y2, x2), weight=distance)
+                x1, y1, *z1 = coords[i]
+                x2, y2, *z2 = coords[i + 1]
+                ele1 = z1[0] if z1 else 0
+                ele2 = z2[0] if z2 else 0
+                distance = haversine_distance(y1, x1, y2, x2)
+                G.add_edge((y1, x1, ele1), (y2, x2, ele2), weight=distance)
     return G
 
 def compute_path(G, start_target, end_target):
-    start = min(G.nodes, key=lambda n: (n[0] - start_target[0])**2 + (n[1] - start_target[1])**2)
-    end = min(G.nodes, key=lambda n: (n[0] - end_target[0])**2 + (n[1] - end_target[1])**2)
+    def dist2D(n, target):
+        return (n[0] - target[0])**2 + (n[1] - target[1])**2
+
+    start = min(G.nodes, key=lambda n: dist2D(n, start_target))
+    end = min(G.nodes, key=lambda n: dist2D(n, end_target))
     print(f"Start node: {start}")
     print(f"End node: {end}")
     return nx.shortest_path(G, source=start, target=end, weight='weight')
 
-# Main Executable Section
+def arm_and_drive(vehicle):
+    while not vehicle.is_armable:
+        print(" Waiting for vehicle to become armable...")
+        time.sleep(1)
+    vehicle.mode = VehicleMode("GUIDED")
+    vehicle.armed = True
+    while not vehicle.armed:
+        print(" Waiting for arming...")
+        time.sleep(1)
+    print("Vehicle armed and in GUIDED mode")
+
+def goto_location(vehicle, location):
+    print(f"Going to: {location.lat}, {location.lon}")
+    vehicle.simple_goto(location)
+    time.sleep(5)  
 
 def main():
-    vehicle, args = connectMyCopter()
-    G = load_graph_from_geojson(args.geojson)
-    print(f"Graph has {len(G.nodes)} nodes and {len(G.edges)} edges")
-    
-    start_target = (47.7589, -122.1913)
-    end_target   = (47.7592, -122.1899)
-    path_nodes = compute_path(G, start_target, end_target)
-    
-    altitude = 2 
-    waypoints = [LocationGlobalRelative(lat, lon, altitude) for lat, lon in path_nodes]
-    
-    print("\nComputed Waypoints:")
-    for i, wp in enumerate(waypoints, 1):
-        print(f"{i}: ({wp.lat}, {wp.lon}, {wp.alt})")
-    
-    try:
-        for i, waypoint in enumerate(waypoints, 1):
-            print(f"\n--- Navigating to waypoint {i} ---")
-            calculate_direction(waypoint, vehicle)
-        print("\n All waypoints reached successfully!")
-    finally:
-        vehicle.close()
+    vehicle = connect('127.0.0.1:14550', wait_ready=True)
+    print("Connected to vehicle")
+
+    graph = load_graph_from_geojson("uwb.geojson")
+
+    start_coord = (47.758, -122.191)  # example
+    end_coord = (47.760, -122.188)
+
+    path_nodes = compute_path(graph, start_coord, end_coord)
+    print("Computed path:", path_nodes)
+
+    waypoints = [
+        LocationGlobalRelative(lat, lon, 0) 
+        for lat, lon, _ in path_nodes
+    ]
+
+    arm_and_drive(vehicle)
+    for wp in waypoints:
+        goto_location(vehicle, wp)
+
+    print("Path completed.")
+    vehicle.mode = VehicleMode("HOLD")
+    vehicle.close()
 
 if __name__ == "__main__":
     main()
